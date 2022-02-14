@@ -1,0 +1,97 @@
+#!python
+import signalgen
+import schema_grapher
+import argparse
+import os
+import json
+import shutil
+import subprocess
+import re
+import logging
+import time
+import pickle
+import random
+import numpy as np
+
+def main():
+    parser = argparse.ArgumentParser(description='SignalGen generates RDF from JSON Templates.')
+    parser.add_argument('-i', type = str, required = True, help="The input config file of the parsing job.")
+    parser.add_argument('-v', default=False, action='store_true', help="Validate output using reverse algorithm.")
+    args = parser.parse_args()
+
+    parser = argparse.ArgumentParser()
+
+    if not os.path.exists(args.i):
+        raise Exception("Config file not found.")
+
+    config = None
+    with open(args.i) as f:
+        config = json.load(f)
+    for k,v in dict(os.environ).items():
+        try:
+            config[k] = json.loads(v)
+        except:
+            config[k] = v
+
+    logger = logging.getLogger('signalgen_logger')
+    logger.setLevel(logging.DEBUG)
+    fh = logging.FileHandler(os.path.join(config['LOGGER_DIR'], "signalgen_"+str(int(time.time()))+'.log'))
+    fh.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s\t - %(pathname)s - %(funcName)s\t - %(message)s')
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+
+    logger.debug('Getting schema_grapher property type')
+    pt = schema_grapher.util.rdf.PropertyType(config['SCHEMA'])
+
+    logger.debug('Running AttributeGen using the "WORLD_GRAPH_DIR" from the config.')
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+    if "WORLD_GRAPH_CACHE" in config.keys() and config["WORLD_GRAPH_CACHE"] != "" and os.path.exists(config["WORLD_GRAPH_CACHE"]):
+        with open(config["WORLD_GRAPH_CACHE"], 'rb') as wgc: 
+            agen = signalgen.template.AttributeGen(config["WORLD_GRAPH_DIR"], attrcounts = pickle.load(wgc))
+    elif "WORLD_GRAPH_DIR" in config.keys() and config["WORLD_GRAPH_DIR"] != "" and os.path.exists(config["WORLD_GRAPH_DIR"]):
+        agen = signalgen.template.AttributeGen(config["WORLD_GRAPH_DIR"])
+    else:
+        agen = signalgen.template.AttributeGen('', attrcounts = signalgen.template.stats.Stats(config['SCHEMA'], config['QUERY_API']))
+
+    for c in config["SIGNALS"]:
+        if c["TEMPLATE_VERSION"] in signalgen.template.TemplateParserV1.TEMPLATE_VERSION:
+            if len(c["INPUT_TEMPLATES"]) > 1:
+                logger.debug('Merging of templates is not supported for templates in schema version V1.0+')
+            NFname = os.path.basename(c["INPUT_TEMPLATES"][0]).split(".")[0]
+            basefolder = os.path.join(c["TEMPLATE_OUTPUT_DIR"], NFname)
+            if not os.path.exists(basefolder):
+                os.mkdir(basefolder)
+            NTemplate = shutil.copyfile(c["INPUT_TEMPLATES"][0], os.path.join(basefolder, NFname + ".json"))
+            for i in c["INPUT_COMPONENTS"]:
+                for j in os.listdir(i):
+                    if os.path.isfile(os.path.join(i,j)):
+                        shutil.copyfile(os.path.join(i,j), os.path.join(basefolder, j))
+        else:
+            NFname = os.path.basename(c["INPUT_TEMPLATES"][0]).split(".")[0] + "_" + os.path.basename(c["INPUT_TEMPLATES"][-1]).split(".")[0] if len(c["INPUT_TEMPLATES"]) > 1 else os.path.basename(c["INPUT_TEMPLATES"][0]).split(".")[0]
+            NTemplate = signalgen.template.TemplateMerger(c["INPUT_TEMPLATES"][0], c["INPUT_TEMPLATES"][-1]).MixMerge().AddComparisonConstraints().WriteTemplate(os.path.join(c["TEMPLATE_OUTPUT_DIR"], NFname + ".json")) if len(c["INPUT_TEMPLATES"]) > 1 else shutil.copyfile(c["INPUT_TEMPLATES"][0], os.path.join(c["TEMPLATE_OUTPUT_DIR"], NFname + ".json"))
+        for difficulty in c["DIFFICULTIES"]:
+            random.seed(difficulty["SEED"])
+            np.random.seed(difficulty["SEED"])
+            NTemplate = str(difficulty["DIFFICULTY"]).replace('0.','') + "_" + str(difficulty["SEED"]) + "_" + os.path.basename(c["INPUT_TEMPLATES"][0]).split(".")[0] + "_" + os.path.basename(c["INPUT_TEMPLATES"][-1]).split(".")[0] if len(c["INPUT_TEMPLATES"]) > 1 else str(difficulty["DIFFICULTY"]).replace('0.','') + "_" + str(difficulty["SEED"]) + "_" + os.path.basename(c["INPUT_TEMPLATES"][0]).split(".")[0]
+            if c["TEMPLATE_VERSION"] in signalgen.template.TemplateParserV1.TEMPLATE_VERSION:
+                signalgen.template.TemplateParserV1(os.path.join(c["TEMPLATE_OUTPUT_DIR"], NFname, NFname + ".json"), c["INPUT_COMPONENTS"], pt, float(c["LATLON"][0]), float(c["LATLON"][1]), difficulty["SEED"], c["DATE"], difficulty["DIFFICULTY"], agen.GenerateAttribute, difficulty["PARTIAL"] if "PARTIAL" in difficulty.keys() else None).LoadComponents().MergeHydratedToTemplate().GenerateThings().GenerateComparisons().GenerateFakes().GenerateRDF().WriteTriples(os.path.join(c["SIGNAL_OUTPUT_DIR"], NTemplate + ".nt"))
+            else:
+                signalgen.template.TemplateParser(os.path.join(c["TEMPLATE_OUTPUT_DIR"], NFname + ".json"), pt, float(c["LATLON"][0]), float(c["LATLON"][1]), difficulty["SEED"], c["DATE"], difficulty["DIFFICULTY"], agen.GenerateAttribute).GenerateSubTemplates().ResolveIdentities().GenerateThings().GenerateRelationships().GenerateComparisons().GenerateRDF().WriteTriples(os.path.join(c["SIGNAL_OUTPUT_DIR"], NTemplate + ".nt"))
+        if args.v:
+            if c["TEMPLATE_VERSION"] in signalgen.template.TemplateParserV1.TEMPLATE_VERSION:
+                valoutput = subprocess.run([os.path.join(config["REVERSE_ALGORITHM"], 'run_reverse_algorithm_docker.sh'), '-s', c["SIGNAL_OUTPUT_DIR"], '-t', os.path.join(c["TEMPLATE_OUTPUT_DIR"], NFname, NFname + ".json")], capture_output=True)
+            else:
+                valoutput = subprocess.run([os.path.join(config["REVERSE_ALGORITHM"], 'run_reverse_algorithm_docker.sh'), '-s', c["SIGNAL_OUTPUT_DIR"], '-t', os.path.join(c["TEMPLATE_OUTPUT_DIR"], NFname + ".json")], capture_output=True)
+            print(ansi_escape.sub('',valoutput.stdout.decode('UTF-8')))
+
+    if "WORLD_GRAPH_CACHE" in config.keys() and config["WORLD_GRAPH_CACHE"] != "" and "UPDATE_WORLD_GRAPH_CACHE" in config.keys() and config["UPDATE_WORLD_GRAPH_CACHE"] == True:
+        with open(config["WORLD_GRAPH_CACHE"], 'wb') as wgc:
+            pickle.dump(agen.attrcounts, wgc)
+
+    logger.debug('Done.')
+    return
+
+if __name__ == '__main__':
+    main()

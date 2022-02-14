@@ -1,0 +1,5 @@
+rdflib
+numpy
+geopy
+requests
+Faker
